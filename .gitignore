@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.env
+data/
+vector_store/
+.streamlit/
+chroma_db_store/

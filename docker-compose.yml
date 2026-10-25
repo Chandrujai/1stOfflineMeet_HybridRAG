@@ -1,0 +1,14 @@
+services:
+  hybrid-rag:
+    build: .
+    container_name: streamlit_hybrid_rag
+    restart: unless-stopped
+    ports:
+      - "8502:8502"
+    env_file:
+      - .env
+    volumes:
+      - chroma_store:/app/chroma_db_store
+
+volumes:
+  chroma_store:
