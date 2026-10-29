@@ -1,5 +1,4 @@
 import os
-import io
 import re
 import streamlit as st
 import networkx as nx
@@ -14,6 +13,11 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CHROMA_DIR = os.path.join(APP_DIR, "chroma_db_store")
+UPLOAD_DIR = os.path.join(APP_DIR, "uploaded_files")
+GRAPH_PATH = os.path.join(CHROMA_DIR, "knowledge_graph.graphml")
 
 # LangChain & NetworkX Imports
 from langchain_core.documents import Document
@@ -42,45 +46,88 @@ if "graph" not in st.session_state:
     st.session_state.graph = nx.DiGraph()
 if "indexed" not in st.session_state:
     st.session_state.indexed = False
+if "persistence_loaded" not in st.session_state:
+    st.session_state.persistence_loaded = False
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(CHROMA_DIR, exist_ok=True)
 
 # ==============================================================================
 # Helper Functions: Robust File Parsers
 # ==============================================================================
-def parse_uploaded_file(uploaded_file):
-    temp_filename = f"temp_{uploaded_file.name}"
-    with open(temp_filename, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    
+def save_uploaded_files(uploaded_files):
+    for uploaded_file in uploaded_files:
+        filename = os.path.basename(uploaded_file.name.replace("\\", "/"))
+        if not filename:
+            raise ValueError("Uploaded file must have a valid filename.")
+        destination = os.path.join(UPLOAD_DIR, filename)
+        with open(destination, "wb") as file:
+            file.write(uploaded_file.getbuffer())
+
+
+def get_saved_file_paths():
+    supported_extensions = {".pdf", ".docx", ".doc", ".txt", ".md"}
+    return [
+        os.path.join(UPLOAD_DIR, filename)
+        for filename in sorted(os.listdir(UPLOAD_DIR))
+        if os.path.isfile(os.path.join(UPLOAD_DIR, filename))
+        and os.path.splitext(filename)[1].lower() in supported_extensions
+    ]
+
+
+def parse_document_file(file_path):
     docs = []
-    file_ext = uploaded_file.name.split(".")[-1].lower()
-    
-    try:
-        if file_ext == "pdf":
-            reader = pypdf.PdfReader(temp_filename)
-            text = ""
-            for i, page in enumerate(reader.pages):
-                page_text = page.extract_text()
-                if page_text:
-                    text += f"\n--- Page {i+1} ---\n" + page_text
-            if text.strip():
-                docs.append(Document(page_content=text, metadata={"source": uploaded_file.name}))
-                
-        elif file_ext in ["docx", "doc"]:
-            doc = DocxDocument(temp_filename)
-            text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-            if text.strip():
-                docs.append(Document(page_content=text, metadata={"source": uploaded_file.name}))
-                
-        elif file_ext in ["txt", "md"]:
-            with open(temp_filename, "r", encoding="utf-8", errors="ignore") as f:
-                text = f.read()
-            if text.strip():
-                docs.append(Document(page_content=text, metadata={"source": uploaded_file.name}))
-    finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+    filename = os.path.basename(file_path)
+    file_ext = os.path.splitext(filename)[1].lower()
+
+    if file_ext == ".pdf":
+        reader = pypdf.PdfReader(file_path)
+        text = ""
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n--- Page {i+1} ---\n" + page_text
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename}))
+
+    elif file_ext in {".docx", ".doc"}:
+        doc = DocxDocument(file_path)
+        text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename}))
+
+    elif file_ext in {".txt", ".md"}:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+            text = file.read()
+        if text.strip():
+            docs.append(Document(page_content=text, metadata={"source": filename}))
             
     return docs
+
+
+def restore_persisted_data():
+    if os.path.exists(GRAPH_PATH):
+        st.session_state.graph = nx.read_graphml(GRAPH_PATH)
+
+    if not OPENAI_API_KEY:
+        return
+
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    vector_db = Chroma(
+        persist_directory=CHROMA_DIR,
+        embedding_function=embeddings,
+    )
+    if vector_db.get(limit=1)["ids"]:
+        st.session_state.vector_db = vector_db
+        st.session_state.indexed = True
+
+
+if not st.session_state.persistence_loaded:
+    try:
+        restore_persisted_data()
+    except Exception as e:
+        st.error(f"Error restoring persisted documents and indices: {e}")
+    st.session_state.persistence_loaded = True
 
 # ==============================================================================
 # Helper Functions: NetworkX Graph Queries
@@ -116,6 +163,11 @@ with st.sidebar:
         type=["pdf", "docx", "doc", "txt", "md"],
         accept_multiple_files=True
     )
+    saved_file_paths = get_saved_file_paths()
+    if saved_file_paths:
+        st.caption("Saved documents (available after restarting the app):")
+        for file_path in saved_file_paths:
+            st.write(f"- {os.path.basename(file_path)}")
     
     chunk_size = st.slider("Chunk Size", min_value=200, max_value=2000, value=800, step=100)
     chunk_overlap = st.slider("Chunk Overlap", min_value=0, max_value=400, value=100, step=20)
@@ -128,48 +180,53 @@ with st.sidebar:
 if process_button:
     if not OPENAI_API_KEY:
         st.error("OpenAI API Key is missing. Check your environment or .env file.")
-    elif not uploaded_files:
-        st.warning("Please upload at least one document.")
     else:
         with st.spinner("Parsing documents & building Hybrid Vector + NetworkX Graph Indices..."):
             try:
-                all_docs = []
-                for file in uploaded_files:
-                    docs = parse_uploaded_file(file)
-                    all_docs.extend(docs)
-                
-                if not all_docs:
-                    st.error("No extractable text found in the uploaded files.")
+                if uploaded_files:
+                    save_uploaded_files(uploaded_files)
+                saved_file_paths = get_saved_file_paths()
+                if not saved_file_paths:
+                    st.warning("Please upload at least one document.")
                 else:
-                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                    chunks = text_splitter.split_documents(all_docs)
-                    
-                    # 1. Vector DB Pipeline (Chroma)
-                    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-                    vector_db = Chroma.from_documents(
-                        documents=chunks,
-                        embedding=embeddings,
-                        persist_directory="./chroma_db_store"
-                    )
-                    st.session_state.vector_db = vector_db
-                    
-                    # 2. NetworkX Knowledge Graph Pipeline via LLM Transformer
-                    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-                    transformer = LLMGraphTransformer(llm=llm)
-                    graph_docs = transformer.convert_to_graph_documents(chunks)
-                    
-                    # Populate NetworkX DiGraph using .relationships instead of .rels
-                    G = nx.DiGraph()
-                    for gdoc in graph_docs:
-                        for node in gdoc.nodes:
-                            G.add_node(node.id, type=node.type)
-                        for rel in gdoc.relationships:
-                            G.add_edge(rel.source.id, rel.target.id, relation=rel.type)
-                            
-                    st.session_state.graph = G
-                    st.session_state.indexed = True
-                    st.success(f"Processing Complete! Created {len(chunks)} vector chunks & {G.number_of_nodes()} graph nodes.")
-                
+                    all_docs = []
+                    for file_path in saved_file_paths:
+                        docs = parse_document_file(file_path)
+                        all_docs.extend(docs)
+
+                    if not all_docs:
+                        st.error("No extractable text found in the uploaded files.")
+                    else:
+                        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                        chunks = text_splitter.split_documents(all_docs)
+
+                        # 1. Vector DB Pipeline (Chroma)
+                        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+                        vector_db = Chroma.from_documents(
+                            documents=chunks,
+                            embedding=embeddings,
+                            persist_directory=CHROMA_DIR
+                        )
+                        st.session_state.vector_db = vector_db
+
+                        # 2. NetworkX Knowledge Graph Pipeline via LLM Transformer
+                        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+                        transformer = LLMGraphTransformer(llm=llm)
+                        graph_docs = transformer.convert_to_graph_documents(chunks)
+
+                        # Populate NetworkX DiGraph using .relationships instead of .rels
+                        G = nx.DiGraph()
+                        for gdoc in graph_docs:
+                            for node in gdoc.nodes:
+                                G.add_node(node.id, type=node.type)
+                            for rel in gdoc.relationships:
+                                G.add_edge(rel.source.id, rel.target.id, relation=rel.type)
+
+                        st.session_state.graph = G
+                        nx.write_graphml(G, GRAPH_PATH)
+                        st.session_state.indexed = True
+                        st.success(f"Processing Complete! Created {len(chunks)} vector chunks & {G.number_of_nodes()} graph nodes.")
+
             except Exception as e:
                 st.error(f"Error during ingestion pipeline: {e}")
 

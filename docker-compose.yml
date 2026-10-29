@@ -9,6 +9,17 @@ services:
       - .env
     volumes:
       - chroma_store:/app/chroma_db_store
+      - uploaded_files:/app/uploaded_files
+
+        labels:
+          - "traefik.enable=true"
+          - "traefik.http.routers.offlinemeet.rule=Host(`offlinemeet.tech`)"
+          - "traefik.http.routers.offlinemeet.entrypoints=websecure"
+          - "traefik.http.routers.offlinemeet.tls=true"
+          - "traefik.http.routers.offlinemeet.tls.certresolver=letsencrypt"
+          - "traefik.http.services.offlinemeet.loadbalancer.server.port=8502"
+          - "traefik.docker.network=1stofflinemeet_hybridrag_default"
 
 volumes:
   chroma_store:
+  uploaded_files:
